@@ -63,7 +63,9 @@ def process_pdf(file, file_key):
                 documents=split_pages, embedding=embedding_model
             )
 
-            retriever = vectorstore.as_retriever(k=2)
+            retriever = vectorstore.as_retriever(
+                search_type="mmr", search_kwargs={"k": 3}
+            )
             llm = Ollama(model="llama-3-Korean-Bllossom-8B-gguf-Q4_K_M")
 
             question_rephrasing_chain = create_question_rephrasing_chain(llm, retriever)
@@ -87,7 +89,7 @@ def create_question_rephrasing_chain(llm, retriever):
         [
             SystemMessagePromptTemplate.from_template(system_prompt),
             MessagesPlaceholder(variable_name="chat_history"),
-            HumanMessagePromptTemplate.from_template("{question}"),
+            HumanMessagePromptTemplate.from_template("{input}"),
         ]
     )
 
@@ -101,11 +103,25 @@ def create_question_answering_chain(llm):
         [
             SystemMessagePromptTemplate.from_template(system_prompt),
             MessagesPlaceholder(variable_name="chat_history"),
-            HumanMessagePromptTemplate.from_template("{question}"),
+            HumanMessagePromptTemplate.from_template("{input}"),
         ]
     )
 
     return create_stuff_documents_chain(llm, prompt)
+
+
+def clean_data(data):
+    cleaned_data = []
+    for item in data:
+        cleaned_page_content = item.page_content.replace("\n", " ").strip()
+        cleaned_metadata = {
+            "page": item.metadata["page"],
+            "total_pages": item.metadata["total_pages"],
+        }
+        cleaned_data.append(
+            {"page_content": cleaned_page_content, "metadata": cleaned_metadata}
+        )
+    return cleaned_data
 
 
 def main():
@@ -123,7 +139,7 @@ def main():
                 process_pdf(uploaded_file, file_key)
                 st.write("Document indexed successfully!")
                 st.write("Ready to chat!")
-                display_pdf(uploaded_file)
+                # display_pdf(uploaded_file) # 버그로 인해 주석 처리
             except Exception as e:
                 st.write(f"Error: {e}")
                 st.stop()
@@ -137,17 +153,17 @@ def main():
     if (
         st.session_state.rag_chain is not None
     ):  # RAG 체인이 생성되었을 때만 채팅 입력 활성화
-        if question := st.chat_input("Ask a question!"):
+        if prompt := st.chat_input("Ask a question!"):
             MAX_MESSAGES_BEFORE_DELETION = 4
 
             if len(st.session_state.messages) >= MAX_MESSAGES_BEFORE_DELETION:
                 del st.session_state.messages[0]
                 del st.session_state.messages[0]
 
-            st.session_state.messages.append({"role": "user", "content": question})
+            st.session_state.messages.append({"role": "user", "content": prompt})
 
             with st.chat_message("user"):
-                st.markdown(question)
+                st.markdown(prompt)
 
             with st.chat_message("assistant"):
                 message_placeholder = st.empty()
@@ -155,11 +171,17 @@ def main():
 
                 rag_chain = st.session_state.rag_chain
                 result = rag_chain.invoke(
-                    {"question": question, "chat_history": st.session_state.messages}
+                    {"input": prompt, "chat_history": st.session_state.messages}
                 )
 
-                with st.expander("Evidence context"):
-                    st.write(result["context"])
+                cleaned_datas = clean_data(result["context"])
+
+                for cleaned_data in cleaned_datas:
+                    with st.expander("Evidence context"):
+                        st.write(f"Page Content: {cleaned_data['page_content']}")
+                        st.write(
+                            f"Page: {cleaned_data['metadata']['page']}/{cleaned_data['metadata']['total_pages']}"
+                        )
 
                 for chunk in result["answer"].split(" "):
                     full_response += chunk + " "
