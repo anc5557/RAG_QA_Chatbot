@@ -2,9 +2,9 @@ import base64
 import os
 import tempfile
 import time
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 import streamlit as st
 import uuid
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -20,12 +20,12 @@ from langchain_core.prompts import (
 from langchain.chains.combine_documents import create_stuff_documents_chain
 
 
-if "id" not in st.session_state:
-    st.session_state.id = uuid.uuid4()
-    st.session_state.file_cache = {}
-
-session_id = st.session_state.id
-client = None
+def initialize_session():
+    if "id" not in st.session_state:
+        st.session_state.id = uuid.uuid4()
+        st.session_state.file_cache = {}
+        st.session_state.messages = []
+        st.session_state.rag_chain = None  # RAG 체인 초기화
 
 
 def reset_chat():
@@ -40,128 +40,138 @@ def display_pdf(file):
     st.markdown(pdf_display, unsafe_allow_html=True)
 
 
-with st.sidebar:
-    st.header("Upload PDF")
-    uploaded_file = st.file_uploader("Choose a PDF file", type=["pdf"])
+def process_pdf(file, file_key):
+    with tempfile.TemporaryDirectory() as temp_dir:
+        file_path = os.path.join(temp_dir, file.name)
+        with open(file_path, "wb") as f:
+            f.write(file.getvalue())
 
-    if uploaded_file:
-        try:
-            file_key = f"{session_id}-{uploaded_file.name}"
+        if file_key not in st.session_state.file_cache:
+            loader = PyMuPDFLoader(file_path)
+            embedding_model = HuggingFaceEmbeddings(
+                model_name="jhgan/ko-sroberta-multitask"
+            )
 
-            with tempfile.TemporaryDirectory() as temp_dir:
-                file_path = os.path.join(temp_dir, uploaded_file.name)
-                with open(file_path, "wb") as f:
-                    f.write(uploaded_file.getvalue())
+            pages = loader.load()
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000, chunk_overlap=50
+            )
+            split_pages = text_splitter.split_documents(pages)
+            print(f"분할된 청크의수: {len(split_pages)}")
 
+            vectorstore = FAISS.from_documents(
+                documents=split_pages, embedding=embedding_model
+            )
+
+            retriever = vectorstore.as_retriever(k=2)
+            llm = Ollama(model="llama-3-Korean-Bllossom-8B-gguf-Q4_K_M")
+
+            question_rephrasing_chain = create_question_rephrasing_chain(llm, retriever)
+            question_answering_chain = create_question_answering_chain(llm)
+
+            rag_chain = create_retrieval_chain(
+                question_rephrasing_chain, question_answering_chain
+            )
+
+            st.session_state.file_cache[file_key] = rag_chain
+
+        st.session_state.rag_chain = st.session_state.file_cache[
+            file_key
+        ]  # RAG 체인 설정
+
+
+def create_question_rephrasing_chain(llm, retriever):
+    system_prompt = """이전 대화 내용과 최신 사용자 질문이 있을 때, 이 질문이 이전 대화 내용과 관련이 있을 수 있습니다. 이런 경우, 대화 내용을 알 필요 없이 독립적으로 이해할 수 있는 질문으로 바꾸세요. 질문에 답할 필요는 없고, 필요하다면 그저 다시 구성하거나 그대로 두세요."""
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            SystemMessagePromptTemplate.from_template(system_prompt),
+            MessagesPlaceholder(variable_name="chat_history"),
+            HumanMessagePromptTemplate.from_template("{question}"),
+        ]
+    )
+
+    return create_history_aware_retriever(llm, retriever, prompt)
+
+
+def create_question_answering_chain(llm):
+    system_prompt = """질문-답변 업무를 돕는 보조원입니다. 질문에 답하기 위해 검색된 내용을 사용하세요. 답을 모르면 모른다고 말하세요. 답변은 세 문장 이내로 간결하게 유지하세요.\n\n## 답변 예시\n답변 내용:\n증거:\n\n{context}"""
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            SystemMessagePromptTemplate.from_template(system_prompt),
+            MessagesPlaceholder(variable_name="chat_history"),
+            HumanMessagePromptTemplate.from_template("{question}"),
+        ]
+    )
+
+    return create_stuff_documents_chain(llm, prompt)
+
+
+def main():
+    initialize_session()
+    session_id = st.session_state.id
+
+    with st.sidebar:
+        st.header("Upload PDF")
+        uploaded_file = st.file_uploader("Choose a PDF file", type=["pdf"])
+
+        if uploaded_file:
+            try:
+                file_key = f"{session_id}-{uploaded_file.name}"
                 st.write("Indexing your document...")
-
-                if file_key not in st.session_state.file_cache:
-                    loader = PyMuPDFLoader(file_path)
-
-                    embedding_model = HuggingFaceEmbeddings(
-                        model_name="jhgan/ko-sroberta-multitask"
-                    )
-
-                    pages = loader.load()
-
-                    text_splitter = RecursiveCharacterTextSplitter(
-                        chunk_size=1000, chunk_overlap=50
-                    )
-                    split_pages = text_splitter.split_documents(pages)
-                    print(f"분할된 청크의수: {len(split_pages)}")
-
-                    vectorstore = FAISS.from_documents(
-                        documents=split_pages, embedding=embedding_model
-                    )
-
-                    retriever = vectorstore.as_retriever(k=2)
-
-                    llm = Ollama(model="llama-3-Korean-Bllossom-8B-gguf-Q4_K_M")
-
-                    question_rephrasing_chain_system_prompt = """이전 대화 내용과 최신 사용자 질문이 있을 때, 이 질문이 이전 대화 내용과 관련이 있을 수 있습니다. 이런 경우, 대화 내용을 알 필요 없이 독립적으로 이해할 수 있는 질문으로 바꾸세요. 질문에 답할 필요는 없고, 필요하다면 그저 다시 구성하거나 그대로 두세요."""
-
-                    question_rephrasing_chain_prompt = ChatPromptTemplate.from_messages(
-                        [
-                            SystemMessagePromptTemplate.from_template(
-                                question_rephrasing_chain_system_prompt
-                            ),
-                            MessagesPlaceholder(variable_name="chat_history"),
-                            HumanMessagePromptTemplate.from_template("{question}"),
-                        ]
-                    )
-
-                    history_aware_retriever = create_history_aware_retriever(
-                        llm, retriever, question_rephrasing_chain_prompt
-                    )
-
-                    question_answering_chain_system_prompt = """질문-답변 업무를 돕는 보조원입니다. 질문에 답하기 위해 검색된 내용을 사용하세요. 답을 모르면 모른다고 말하세요. 답변은 세 문장 이내로 간결하게 유지하세요.\n\n## 답변 예시\n답변 내용:\n증거:\n\n{context}"""
-
-                    question_answering_chain_prompt = ChatPromptTemplate.from_messages(
-                        [
-                            SystemMessagePromptTemplate.from_template(
-                                question_answering_chain_system_prompt
-                            ),
-                            MessagesPlaceholder(variable_name="chat_history"),
-                            HumanMessagePromptTemplate.from_template("{question}"),
-                        ]
-                    )
-
-                    question_answering_chain = create_stuff_documents_chain(
-                        llm, question_answering_chain_prompt
-                    )
-
-                    rag_chain = create_retrieval_chain(
-                        history_aware_retriever, question_answering_chain
-                    )
-
-                    st.session_state.file_cache[file_key] = rag_chain
-
-                else:
-                    rag_chain = st.session_state.file_cache[file_key]
-
+                process_pdf(uploaded_file, file_key)
                 st.write("Document indexed successfully!")
                 st.write("Ready to chat!")
                 display_pdf(uploaded_file)
-        except Exception as e:
-            st.write(f"Error: {e}")
-            st.stop()
+            except Exception as e:
+                st.write(f"Error: {e}")
+                st.stop()
 
-st.title("PDF Chatbot")
-st.write("사이드바에서 pdf 파일을 업로드 해주세요.")
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+    st.title("PDF Chatbot")
 
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-if question := st.chat_input("Ask a question!"):
-    MAX_MESSAGES_BEFORE_DELETION = 4
+    if (
+        st.session_state.rag_chain is not None
+    ):  # RAG 체인이 생성되었을 때만 채팅 입력 활성화
+        if question := st.chat_input("Ask a question!"):
+            MAX_MESSAGES_BEFORE_DELETION = 4
 
-    if len(st.session_state.messages) >= MAX_MESSAGES_BEFORE_DELETION:
-        del st.session_state.messages[0]
-        del st.session_state.messages[0]
+            if len(st.session_state.messages) >= MAX_MESSAGES_BEFORE_DELETION:
+                del st.session_state.messages[0]
+                del st.session_state.messages[0]
 
-    st.session_state.messages.append({"role": "user", "content": question})
+            st.session_state.messages.append({"role": "user", "content": question})
 
-    with st.chat_message("user"):
-        st.markdown(question)
+            with st.chat_message("user"):
+                st.markdown(question)
 
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        full_response = ""
+            with st.chat_message("assistant"):
+                message_placeholder = st.empty()
+                full_response = ""
 
-        result = rag_chain.invoke(
-            {"question": question, "chat_history": st.session_state.messages}
-        )
+                rag_chain = st.session_state.rag_chain
+                result = rag_chain.invoke(
+                    {"question": question, "chat_history": st.session_state.messages}
+                )
 
-        with st.expander("Evidence context"):
-            st.write(result["context"])
+                with st.expander("Evidence context"):
+                    st.write(result["context"])
 
-        for chunk in result["answer"].split(" "):
-            full_response += chunk + " "
-            time.sleep(0.2)
-            message_placeholder.markdown(full_response + "▌")
-            message_placeholder.markdown(full_response)
+                for chunk in result["answer"].split(" "):
+                    full_response += chunk + " "
+                    time.sleep(0.2)
+                    message_placeholder.markdown(full_response + "▌")
+                    message_placeholder.markdown(full_response)
 
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+            st.session_state.messages.append(
+                {"role": "assistant", "content": full_response}
+            )
+    else:
+        st.write("사이드 바에서 pdf 파일을 업로드 해주세요.")
+
+
+main()
