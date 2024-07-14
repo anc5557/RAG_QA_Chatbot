@@ -20,6 +20,5 @@ class User(BaseModel):
 
 
 class GenerateRequest(BaseModel):
+    session_id: str
     question: str
-    pdf_name: str
-
