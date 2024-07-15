@@ -9,12 +9,9 @@ from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_community.llms import Ollama
 from langchain_core.prompts import (
     ChatPromptTemplate,
-    SystemMessagePromptTemplate,
-    HumanMessagePromptTemplate,
     MessagesPlaceholder,
 )
 from langchain.chains.combine_documents import create_stuff_documents_chain
@@ -35,8 +32,9 @@ def reset_chat():
 
 def display_pdf(file):
     st.markdown("### PDF Preview")
+    file.seek(0)
     base64_pdf = base64.b64encode(file.read()).decode("utf-8")
-    pdf_display = f"""<iframe src="data:application/pdf;base64,{base64_pdf}" width="400" height="100%" type="application/pdf" style="height:100vh; width:100%"></iframe>"""
+    pdf_display = f"""<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="600px" type="application/pdf" style="border: none;"></iframe>"""
     st.markdown(pdf_display, unsafe_allow_html=True)
 
 
@@ -54,17 +52,16 @@ def process_pdf(file, file_key):
 
             pages = loader.load()
             text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000, chunk_overlap=50
+                chunk_size=300, chunk_overlap=0
             )
             split_pages = text_splitter.split_documents(pages)
-            print(f"분할된 청크의수: {len(split_pages)}")
 
             vectorstore = FAISS.from_documents(
                 documents=split_pages, embedding=embedding_model
             )
 
             retriever = vectorstore.as_retriever(
-                search_type="mmr", search_kwargs={"k": 3}
+                search_type="similarity", search_kwargs={"k": 3}
             )
             llm = Ollama(model="llama-3-Korean-Bllossom-8B-gguf-Q4_K_M")
 
@@ -83,13 +80,15 @@ def process_pdf(file, file_key):
 
 
 def create_question_rephrasing_chain(llm, retriever):
-    system_prompt = """이전 대화 내용과 최신 사용자 질문이 있을 때, 이 질문이 이전 대화 내용과 관련이 있을 수 있습니다. 이런 경우, 대화 내용을 알 필요 없이 독립적으로 이해할 수 있는 질문으로 바꾸세요. 질문에 답할 필요는 없고, 필요하다면 그저 다시 구성하거나 그대로 두세요."""
+    system_prompt = """이전 대화 내용과 최신 사용자 질문이 있을 때, 이 질문이 이전 대화 내용과 관련이 있을 수 있습니다. 
+    이런 경우, 대화 내용을 알 필요 없이 독립적으로 이해할 수 있는 질문으로 바꾸세요. 
+    질문에 답할 필요는 없고, 필요하다면 그저 다시 구성하거나 그대로 두세요."""
 
     prompt = ChatPromptTemplate.from_messages(
         [
-            SystemMessagePromptTemplate.from_template(system_prompt),
+            ("system", system_prompt),
             MessagesPlaceholder(variable_name="chat_history"),
-            HumanMessagePromptTemplate.from_template("{input}"),
+            ("human", "{input}"),
         ]
     )
 
@@ -97,13 +96,19 @@ def create_question_rephrasing_chain(llm, retriever):
 
 
 def create_question_answering_chain(llm):
-    system_prompt = """질문-답변 업무를 돕는 보조원입니다. 질문에 답하기 위해 검색된 내용을 사용하세요. 답을 모르면 모른다고 말하세요. 답변은 세 문장 이내로 간결하게 유지하세요.\n\n## 답변 예시\n답변 내용:\n증거:\n\n{context}"""
+    system_prompt = """질문-답변 업무를 돕는 보조원입니다. 
+    질문에 답하기 위해 검색된 내용을 사용하세요. 
+    답을 모르면 모른다고 말하세요. 
+    답변은 세 문장 이내로 간결하게 유지하세요.
+
+    ## 검색된 내용
+    {context}"""
 
     prompt = ChatPromptTemplate.from_messages(
         [
-            SystemMessagePromptTemplate.from_template(system_prompt),
+            ("system", system_prompt),
             MessagesPlaceholder(variable_name="chat_history"),
-            HumanMessagePromptTemplate.from_template("{input}"),
+            ("human", "{input}"),
         ]
     )
 
@@ -139,7 +144,7 @@ def main():
                 process_pdf(uploaded_file, file_key)
                 st.write("Document indexed successfully!")
                 st.write("Ready to chat!")
-                # display_pdf(uploaded_file) # 버그로 인해 주석 처리
+                display_pdf(uploaded_file)
             except Exception as e:
                 st.write(f"Error: {e}")
                 st.stop()
@@ -160,8 +165,6 @@ def main():
                 del st.session_state.messages[0]
                 del st.session_state.messages[0]
 
-            st.session_state.messages.append({"role": "user", "content": prompt})
-
             with st.chat_message("user"):
                 st.markdown(prompt)
 
@@ -174,13 +177,15 @@ def main():
                     {"input": prompt, "chat_history": st.session_state.messages}
                 )
 
+                st.session_state.messages.append({"role": "user", "content": prompt})
+
                 cleaned_datas = clean_data(result["context"])
 
                 for cleaned_data in cleaned_datas:
                     with st.expander("Evidence context"):
                         st.write(f"Page Content: {cleaned_data['page_content']}")
                         st.write(
-                            f"Page: {cleaned_data['metadata']['page']}/{cleaned_data['metadata']['total_pages']}"
+                            f"Page: {cleaned_data['metadata']['page']+1}/{cleaned_data['metadata']['total_pages']}"
                         )
 
                 for chunk in result["answer"].split(" "):
